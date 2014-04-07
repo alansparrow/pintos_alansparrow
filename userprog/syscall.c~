@@ -1,0 +1,442 @@
+#include "userprog/syscall.h"
+#include <stdio.h>
+#include <syscall-nr.h>
+#include <user/syscall.h>
+#include "devices/input.h"
+#include "devices/shutdown.h"
+#include "filesys/file.h"
+#include "filesys/filesys.h"
+#include "threads/interrupt.h"
+#include "threads/malloc.h"
+#include "threads/synch.h"
+#include "threads/thread.h"
+#include "threads/vaddr.h"
+#include "userprog/pagedir.h"
+#include "userprog/process.h"
+
+
+#define ERROR_CODE -1
+#define USER_VADDR_BOTTOM ((void *) 0x08048000)
+#define ERROR -1
+static void syscall_handler (struct intr_frame *);
+static void check_address(void *addrr);
+static void get_argument(void *esp, int *arg, int count);
+int user_to_kernel_ptr(const void *vaddr);
+void get_arg (struct intr_frame *f, int *arg, int n);
+void check_valid_ptr (const void *vaddr);
+void check_valid_buffer (void* buffer, unsigned size);
+void check_valid_string (const void* str);
+
+void halt(void);
+void exit(int status);
+bool create(const char *file, unsigned initial_size);
+bool remove(const char *file);
+tid_t exec(const char *cmd_line);
+int wait(tid_t tid);
+/* HW4 */
+int open(const char *file);
+int filesize(int fd);
+int read(int fd, void *buffer, unsigned size);
+int write(int fd, const void *buffer, unsigned size);
+void seek(int fd, unsigned position);
+unsigned tell(int fd);
+void close(int fd);
+
+
+void
+syscall_init (void) 
+{
+  lock_init(&file_lock);
+  intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+}
+
+static void
+syscall_handler (struct intr_frame *f UNUSED) 
+{
+  
+  int system_number = 0;
+  int esp = user_ptr_to_kernel_ptr((const void*) f->esp);
+  uint32_t *arg = NULL;
+  
+  system_number = *((int *) esp);
+  //printf("\n    In System Call: %d\n", system_number);
+
+  switch (system_number) {
+  case SYS_HALT: //0
+    halt();
+    break;
+
+  case SYS_EXIT: //1
+    // argument is in the 32-bit word, here we have 1 arg (status)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+    
+    exit((int) arg[0]);
+    
+    free(arg);
+    break;
+  case SYS_CREATE: //4
+    // argument is in the 32-bit word, here we have 2 args(filename, file_size)
+    arg = (int *) malloc(sizeof(uint32_t)*2);
+    get_argument(esp, arg, 2);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[0]);
+
+    // call function and set return value at eax
+    f->eax = create((char *) arg[0], (int) arg[1]);
+
+    free(arg);
+    break;
+  case SYS_REMOVE: //5
+    // argument is in the 32-bit word, here we have 1 arg(filename)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[0]);
+    
+    // call function and set return value at eax
+    f->eax = remove((char *) arg[0]);
+
+    free(arg);
+    break;
+
+  case SYS_EXEC:
+    // argument is in the 32-bit word, here we have 1 arg(filename)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[0]);
+    
+    // call function and set return value at eax
+    f->eax = exec((char *) arg[0]);
+
+    free(arg);
+    break;
+  case SYS_WAIT:
+    // argument is in the 32-bit word, here we have 1 arg(tid_t thread_id)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // call function and set return value at eax
+    f->eax = wait((tid_t) arg[0]);
+
+    free(arg);
+    break;
+
+    /* HW4 */
+  case SYS_OPEN:
+    // argument is in the 32-bit word, here we have 1 arg(filename)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[0]);
+    
+    // call function and set return value at eax
+    f->eax = open((char *) arg[0]);
+
+    free(arg);
+    break;
+  case SYS_FILESIZE:
+    // argument is in the 32-bit word, here we have 1 arg(int fd)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // call function and set return value at eax
+    f->eax = filesize((int) arg[0]);
+
+    free(arg);
+    break;
+  case SYS_READ:
+    /* argument is in the 32-bit word, here we have 3 arg
+       (int fd, void *buffer, unsigned size) */
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 3);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[1]);
+    
+    // call function and set return value at eax
+    f->eax = read((int) arg[0], (void *) arg[1], (unsigned) arg[2]);
+
+    free(arg);
+    break;
+  case SYS_WRITE:
+    
+    /* argument is in the 32-bit word, here we have 3 arg
+       (int fd, void *buffer, unsigned size) */
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 3);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[1]);
+    
+    // call function and set return value at eax
+    f->eax = write((int) arg[0], (const void *) arg[1], (unsigned) arg[2]);
+
+    free(arg);
+    break;
+  case SYS_SEEK:
+    
+    /* argument is in the 32-bit word, here we have 2 arg
+       (int fd, unsigned position) */
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 2);
+
+    // call function and set return value at eax
+    seek((int) arg[0], (unsigned) arg[1]);
+
+    free(arg);
+    break;
+  case SYS_TELL:
+    
+    // argument is in the 32-bit word, here we have 1 arg(int fd)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // call function and set return value at eax
+    f->eax = tell((int) arg[0]);
+
+    free(arg);
+    break;
+  case SYS_CLOSE:
+    
+    // argument is in the 32-bit word, here we have 1 arg(int fd)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+    
+    // call function and set return value at eax
+    close((int) arg[0]);
+
+    free(arg);
+    break;
+
+  }
+
+
+}
+void halt (void)
+{
+  shutdown_power_off();
+}
+
+void exit (int status)
+{
+  struct thread *cur = thread_current();
+  if (thread_alive(cur->parent) && cur->cp)
+    {
+      cur->cp->status = status;
+    }
+  printf ("%s: exit(%d)\n", cur->name, status);
+  thread_exit();
+}
+
+pid_t exec (const char *cmd_line)
+{
+  pid_t pid = process_execute(cmd_line);
+  struct child_process* cp = get_child_process(pid);
+  if (!cp)
+    {
+      return ERROR;
+    }
+  if (cp->load == NOT_LOADED)
+    {
+      sema_down(&cp->load_sema);
+    }
+  if (cp->load == LOAD_FAIL)
+    {
+      remove_child_process(cp);
+      return ERROR;
+    }
+  return pid;
+}
+
+int wait (pid_t pid)
+{
+  return process_wait(pid);
+}
+
+bool create (const char *file, unsigned initial_size)
+{
+  lock_acquire(&file_lock);
+  bool success = filesys_create(file, initial_size);
+  lock_release(&file_lock);
+  return success;
+}
+
+bool remove (const char *file)
+{
+  lock_acquire(&file_lock);
+  bool success = filesys_remove(file);
+  lock_release(&file_lock);
+  return success;
+}
+
+int open (const char *file)
+{
+  lock_acquire(&file_lock);
+  struct file *f = file_open(file);
+  if (!f)
+    {
+      lock_release(&file_lock);
+      return ERROR;
+    }
+  int fd = process_add_file(f);
+  lock_release(&file_lock);
+  return fd;
+}
+
+int filesize (int fd)
+{
+  lock_acquire(&file_lock);
+  struct file *f = process_get_file(fd);
+  if (!f)
+    {
+      lock_release(&file_lock);
+      return ERROR;
+    }
+  int size = file_length(f);
+  lock_release(&file_lock);
+  return size;
+}
+
+int read (int fd, void *buffer, unsigned size)
+{
+  if (fd == STDIN_FILENO)
+    {
+      unsigned i;
+      uint8_t* local_buffer = (uint8_t *) buffer;
+      for (i = 0; i < size; i++)
+	{
+	  local_buffer[i] = input_getc();
+	}
+      return size;
+    }
+  lock_acquire(&file_lock);
+  struct file *f = process_get_file(fd);
+  if (!f)
+    {
+      lock_release(&file_lock);
+      return ERROR;
+    }
+  int bytes = file_read(f, buffer, size);
+  lock_release(&file_lock);
+  return bytes;
+}
+
+int write (int fd, const void *buffer, unsigned size)
+{
+  if (fd == STDOUT_FILENO)
+    {
+      putbuf(buffer, size);
+      return size;
+    }
+  lock_acquire(&file_lock);
+  struct file *f = process_get_file(fd);
+  if (!f)
+    {
+      lock_release(&file_lock);
+      return ERROR;
+    }
+  int bytes = file_write(f, buffer, size);
+  lock_release(&file_lock);
+  return bytes;
+}
+
+void seek (int fd, unsigned position)
+{
+  lock_acquire(&file_lock);
+  struct file *f = process_get_file(fd);
+  if (!f)
+    {
+      lock_release(&file_lock);
+      return;
+    }
+  file_seek(f, position);
+  lock_release(&file_lock);
+}
+
+unsigned tell (int fd)
+{
+  lock_acquire(&file_lock);
+  struct file *f = process_get_file(fd);
+  if (!f)
+    {
+      lock_release(&file_lock);
+      return ERROR;
+    }
+  off_t offset = file_tell(f);
+  lock_release(&file_lock);
+  return offset;
+}
+
+void close (int fd)
+{
+  lock_acquire(&file_lock);
+  process_close_file(fd);
+  lock_release(&file_lock);
+}
+
+void check_valid_ptr (const void *vaddr)
+{
+  if (!is_user_vaddr(vaddr) || vaddr < USER_VADDR_BOTTOM)
+    {
+      exit(ERROR);
+    }
+}
+
+int user_to_kernel_ptr(const void *vaddr)
+{
+  check_valid_ptr(vaddr);
+  void *ptr = pagedir_get_page(thread_current()->pagedir, vaddr);
+  if (!ptr)
+    {
+      exit(ERROR);
+    }
+  return (int) ptr;
+}
+
+void get_arg (struct intr_frame *f, int *arg, int n)
+{
+  int i;
+  int *ptr;
+  for (i = 0; i < n; i++)
+    {
+      ptr = (int *) f->esp + i + 1;
+      check_valid_ptr((const void *) ptr);
+      arg[i] = *ptr;
+    }
+}
+
+void check_valid_buffer (void* buffer, unsigned size)
+{
+  unsigned i;
+  char* local_buffer = (char *) buffer;
+  for (i = 0; i < size; i++)
+    {
+      check_valid_ptr((const void*) local_buffer);
+      local_buffer++;
+    }
+}
+
+void check_valid_string (const void* str)
+{
+  while (* (char *) user_to_kernel_ptr(str) != 0)
+    {
+      str = (char *) str + 1;
+    }
+}
+
+int user_ptr_to_kernel_ptr(const void *vaddr)
+{
+  check_address(vaddr);
+  void *ptr = pagedir_get_page(thread_current()->pagedir, vaddr);
+  if (!ptr) {
+    exit(ERROR_CODE);
+  }
+
+  return (int) ptr;
+}

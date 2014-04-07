@@ -1,0 +1,447 @@
+#include "userprog/syscall.h"
+#include <stdio.h>
+#include <syscall-nr.h>
+#include "threads/interrupt.h"
+#include "threads/thread.h"
+#include "threads/vaddr.h"
+//#include <filesys/filesys.h>
+#include "filesys/filesys.h"
+#include "userprog/process.h"
+#include "threads/synch.h"
+
+#define DEBUG_MODE
+
+static void syscall_handler (struct intr_frame *);
+static void check_address(void *addrr);
+static void get_argument(void *esp, int *arg, int count);
+
+static void halt(void);
+void exit(int status);
+static bool create(const char *file, unsigned initial_size);
+static bool remove(const char *file);
+static tid_t exec(const char *cmd_line);
+static int wait(tid_t tid);
+/* HW4 */
+static int open(const char *file);
+static int filesize(int fd);
+static int read(int fd, void *buffer, unsigned size);
+static int write(int fd, void *buffer, unsigned size);
+static void seek(int fd, unsigned position);
+static unsigned tell(int fd);
+static void close(int fd);
+
+/* use lock to read, write file */
+struct lock file_lock;
+
+void
+syscall_init (void) 
+{
+  intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
+  lock_init(&file_lock);
+}
+
+static void
+syscall_handler (struct intr_frame *f UNUSED) 
+{
+  
+  int system_number = 0;
+  uint32_t *esp = f->esp; // because in user's stack, it uses 32 bit word
+  uint32_t *arg = NULL;
+  
+  printf ("system call!\n");
+  check_address(esp);
+
+  system_number = *((int *) esp);
+  
+  
+
+  switch (system_number) {
+  case SYS_HALT: //0
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_HALT");
+#endif
+
+    halt();
+    break;
+
+  case SYS_EXIT: //1
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_EXIT");
+#endif
+    
+    // argument is in the 32-bit word, here we have 1 arg (status)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+    
+    exit((int) arg[0]);
+    
+    free(arg);
+    break;
+  case SYS_CREATE: //4
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_CREATE");
+#endif
+    
+    // argument is in the 32-bit word, here we have 2 args(filename, file_size)
+    arg = (int *) malloc(sizeof(uint32_t)*2);
+    get_argument(esp, arg, 2);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[0]);
+
+    // call function and set return value at eax
+    f->eax = create((char *) arg[0], (int) arg[1]);
+
+    free(arg);
+    break;
+  case SYS_REMOVE: //5
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_REMOVE");
+#endif
+    
+    // argument is in the 32-bit word, here we have 1 arg(filename)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[0]);
+    
+    // call function and set return value at eax
+    f->eax = remove((char *) arg[0]);
+
+    free(arg);
+    break;
+
+  case SYS_EXEC:
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_EXEC");
+#endif
+    // argument is in the 32-bit word, here we have 1 arg(filename)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[0]);
+    
+    // call function and set return value at eax
+    f->eax = exec((char *) arg[0]);
+
+    free(arg);
+    break;
+  case SYS_WAIT:
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_WAIT");
+#endif
+    
+    // argument is in the 32-bit word, here we have 1 arg(tid_t thread_id)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // call function and set return value at eax
+    f->eax = wait((tid_t) arg[0]);
+
+    free(arg);
+    break;
+
+    /* HW4 */
+  case SYS_OPEN:
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_OPEN");
+#endif
+    
+    // argument is in the 32-bit word, here we have 1 arg(filename)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[0]);
+    
+    // call function and set return value at eax
+    f->eax = open((char *) arg[0]);
+
+    free(arg);
+    break;
+  case SYS_FILESIZE:
+#ifdef DEBUG_MODE 
+    printf("\n     %s\n", "In SYS_FILESIZE");
+#endif
+    
+    // argument is in the 32-bit word, here we have 1 arg(int fd)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // call function and set return value at eax
+    f->eax = filesize((int) arg[0]);
+
+    free(arg);
+    break;
+  case SYS_READ:
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_READ");
+#endif
+    
+    /* argument is in the 32-bit word, here we have 3 arg
+       (int fd, void *buffer, unsigned size) */
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 3);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[1]);
+    
+    // call function and set return value at eax
+    f->eax = read((int) arg[0], (void *) arg[1], (unsigned) arg[2]);
+
+    free(arg);
+    break;
+  case SYS_WRITE:
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_WRITE");
+#endif
+    
+    /* argument is in the 32-bit word, here we have 3 arg
+       (int fd, void *buffer, unsigned size) */
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 3);
+
+    // check if the pointer's value is in user's memory area
+    check_address((char *) arg[1]);
+    
+    // call function and set return value at eax
+    f->eax = write((int) arg[0], (void *) arg[1], (unsigned) arg[2]);
+
+    free(arg);
+    break;
+  case SYS_SEEK:
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_SEEK");
+#endif
+    
+    /* argument is in the 32-bit word, here we have 2 arg
+       (int fd, unsigned position) */
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 2);
+
+    // call function and set return value at eax
+    seek((int) arg[0], (unsigned) arg[1]);
+
+    free(arg);
+    break;
+  case SYS_TELL:
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_TELL");
+#endif
+    
+    // argument is in the 32-bit word, here we have 1 arg(int fd)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+
+    // call function and set return value at eax
+    f->eax = tell((int) arg[0]);
+
+    free(arg);
+    break;
+  case SYS_CLOSE:
+#ifdef DEBUG_MODE
+    printf("\n     %s\n", "In SYS_CLOSE");
+#endif
+    
+    // argument is in the 32-bit word, here we have 1 arg(int fd)
+    arg = (int *) malloc(sizeof(uint32_t));
+    get_argument(esp, arg, 1);
+    
+    // call function and set return value at eax
+    close((int) arg[0]);
+
+    free(arg);
+    break;
+
+  }
+ 
+  thread_exit ();
+}
+
+static void check_address(void *addrr)
+{
+
+  //if (addrr >= 0xc0000000 && addrr <= 0x08048000) {
+  if (addrr != NULL && is_user_vaddr(addrr)) {
+    printf("\n  Checking esp's value..\n");
+    printf("  OK! %p is in user's memory space\n", addrr);
+  } else {
+    printf("\n  Error: Don't hang out outside user's memory space!\n");
+    printf("\n  Your are at: %p\n", addrr);
+    exit(-1);
+  }
+}
+ 
+static void get_argument(void *esp, int *arg, int count)
+{
+  int i = 0;
+  // cast esp into 32 bit 
+  uint32_t *esp_copy = esp; 
+  // skip the first one which is system call number, +1 mean go up 32 bit
+  esp_copy += 1; 
+    
+  for (i = 0; i < count; i++) {
+    arg[i] = *(esp_copy+i);
+  }
+}
+ 
+ 
+void halt(void)
+{
+  shutdown_power_off();
+}
+
+void exit(int status)
+{
+  printf("\n  %s: exit(%d)\n", thread_name(), status); 
+  thread_exit();
+}
+
+bool create(const char *file, unsigned initial_size)
+{
+  bool result = false;
+
+  lock_acquire(&file_lock);
+  result = filesys_create(file, initial_size);
+  lock_release(&file_lock);
+
+  return result;
+  
+}
+
+bool remove(const char *file)
+{
+  bool result = false;
+
+  lock_acquire(&file_lock);
+  result =  filesys_remove(file);
+  lock_release(&file_lock);
+  
+  return result;
+}
+
+tid_t exec(const char *cmd_line)
+{
+  tid_t result_id = -1;
+    
+  result_id = process_execute(cmd_line);
+    
+  /* wait for memory allocating */
+  sema_down(&thread_current()->load_semaphore);
+    
+  return result_id;
+}
+ 
+int wait(tid_t tid)
+{
+  return process_wait(tid);
+}
+ 
+int open(const char *file)
+{
+  int new_fd = -1;
+
+  lock_acquire(&file_lock);
+  struct file *f = filesys_open(file);
+  
+  /* if sucess, return new fd */
+  if (f)
+    new_fd = process_add_file(f);
+  lock_release(&file_lock);
+
+  return new_fd;
+}
+
+int filesize(int fd)
+{
+  int file_size = -1;
+  
+  struct file *f = process_get_file(fd);
+  
+  
+  if (f) {
+    lock_acquire(&file_lock);
+    file_size = file_length(f);
+    lock_release(&file_lock);
+  }
+
+  return file_size;
+}
+int read(int fd, void *buffer, unsigned size)
+{
+  int read_size = -1;
+  struct file *f = process_get_file(fd);
+  
+  if (f && fd != STDOUT_FILENO && fd != STDERR_FILENO) {
+    lock_acquire(&file_lock);
+    read_size = file_read(f, buffer, size);
+    lock_release(&file_lock);
+  } else if (fd == STDIN_FILENO) {
+    int i = 0;
+    char c;
+    char *buf = (char *) buffer;
+    while (size > 1 && (c = input_getc())) {
+      buf[i] = c;
+      i++;
+      size--;
+    }
+    buf[i] = 0;
+    read_size = i;
+  }
+
+  return read_size;
+}
+
+int write(int fd, void *buffer, unsigned size)
+{
+  int write_size = -1;
+  struct file *f = process_get_file(fd);
+   
+  if (f && fd != STDIN_FILENO && fd != STDERR_FILENO) {
+    lock_acquire(&file_lock);
+    write_size = file_write(f, buffer, size);
+    lock_release(&file_lock);
+  } else if (fd == STDOUT_FILENO) {
+    putbuf(buffer, size);
+    write_size = (int) size;
+  }
+
+  return write_size;
+}
+
+void seek(int fd, unsigned position)
+{
+  struct file *f = process_get_file(fd);
+  
+  if (f) {
+    lock_acquire(&file_lock);
+    file_seek(f, position);
+    lock_release(&file_lock);
+  }
+}
+
+unsigned tell(int fd)
+{
+  int pos = -1;
+  struct file *f = process_get_file(fd);
+  
+  if (f) {
+    lock_acquire(&file_lock);
+    file_tell(f);
+    lock_release(&file_lock);
+  }
+
+  return pos;
+}
+void close(int fd)
+{
+  struct file *f = process_get_file(fd);
+  
+  if (f) {
+    lock_acquire(&file_lock);
+    file_close(f);
+    lock_release(&file_lock);
+  }
+}
